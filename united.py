@@ -63,10 +63,29 @@ class X3UI:
             logger.error(f"Ошибка получения списка клиентов 3x-ui: {str(e)}")
             raise Exception(f"Ошибка получения списка клиентов 3x-ui: {str(e)}")
 
+    def _generate_unique_email(self, user_id, max_attempts=10):
+        """Генерирует уникальный email на основе user_id с суффиксом."""
+        attempt = 1
+        base_email = f"tgid_{user_id}"
+        new_email = base_email
+        while attempt <= max_attempts:
+            exists = any(
+                client.email == new_email
+                for inbound in self.get_client_list()
+                for client in inbound.settings.clients
+            )
+            if not exists:
+                return new_email
+            new_email = f"{base_email}_{attempt}"
+            attempt += 1
+        # Если все попытки исчерпаны, добавляем случайный суффикс
+        return f"{base_email}_{uuid.uuid4().hex[:8]}"
+
     def add_client(self, days, tg_id, user_id, username=None, referral_bonus=0, context=None):
         try:
             client_id = str(uuid.uuid4())
-            email = username if username and username.strip() else str(user_id)
+            # Генерируем уникальный email на основе user_id
+            email = self._generate_unique_email(user_id)
             new_client = Client(
                 id=client_id,
                 email=email,
@@ -74,13 +93,13 @@ class X3UI:
                 expiry_time=self._calculate_expiry_time(days + referral_bonus),
                 total_gb=0,
                 limit_ip=3,
-                tg_id=str(tg_id),
+                tg_id=str(user_id),  # Привязка только по Telegram user_id
                 alter_id=90,
                 flow="xtls-rprx-vision"
             )
             inbound_id = 1
             self.api.client.add(inbound_id, [new_client])
-            logger.info(f"Клиент {email} успешно добавлен с подпиской на {days + referral_bonus} дней и flow xtls-rprx-vision")
+            logger.info(f"Клиент {email} (tg_id: {tg_id}) успешно добавлен с подпиской на {days + referral_bonus} дней")
             if context and context.user_data.get('referral_id'):
                 self.update_referral_stats(context.user_data['referral_id'], user_id)
             return client_id, email
@@ -90,24 +109,100 @@ class X3UI:
 
     def extend_subscription(self, user_id, username=None, days=0):
         try:
-            email = username if username and username.strip() else str(user_id)
+            # Ищем клиента только по tg_id
+            client = None
+            for inbound in self.get_client_list():
+                for c in inbound.settings.clients:
+                    if c.tg_id == str(user_id):
+                        client = c
+                        break
+                if client:
+                    break
+            if not client:
+                raise Exception("Клиент не найден в системе")
+            
             status = self.get_client_status(user_id, username)
             if status['activ'] != 'Активен':
                 raise Exception("У вас нет активной подписки для продления")
             current_expiry = datetime.datetime.strptime(status['time'], '%d.%m.%Y', tzinfo=datetime.timezone.utc)
             new_expiry = current_expiry + datetime.timedelta(days=days)
-            inbounds = self.get_client_list()
-            for inbound in inbounds:
-                for client in inbound.settings.clients:
-                    if client.email == email:
-                        client.expiry_time = int((new_expiry - datetime.datetime.fromtimestamp(0, datetime.timezone.utc)).total_seconds() * 1000.0)
-                        self.api.client.update(client.id, client)
-                        break
-            logger.info(f"Подписка для {email} продлена на {days} дней")
+            client.expiry_time = int((new_expiry - datetime.datetime.fromtimestamp(0, datetime.timezone.utc)).total_seconds() * 1000.0)
+            self.api.client.update(client.id, client)
+            logger.info(f"Подписка для tg_id {user_id} продлена на {days} дней")
             return self.get_client_status(user_id, username)
         except Exception as e:
             logger.error(f"Ошибка продления подписки: {str(e)}")
             raise Exception(f"Ошибка продления подписки: {str(e)}")
+
+    def get_client_status(self, user_id, username=None):
+        try:
+            # Ищем клиента только по tg_id
+            client = None
+            for inbound in self.get_client_list():
+                for c in inbound.settings.clients:
+                    if c.tg_id == str(user_id):
+                        client = c
+                        break
+                if client:
+                    break
+            if not client:
+                logger.debug(f"Клиент с tg_id {user_id} не зарегистрирован")
+                return {'activ': 'Не зарегистрирован', 'time': '-', 'location': 'Netherlands'}
+
+            now_ms = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
+            logger.debug(f"Текущее время (мс, UTC): {now_ms}, Исходное expiry_time: {client.expiry_time}")
+            
+            if client.expiry_time is None or client.expiry_time <= 0:
+                logger.warning(f"Некорректное значение expiry_time для клиента {client.email}: {client.expiry_time}")
+                return {'activ': 'Не Активен', 'time': '-', 'location': 'Netherlands'}
+            
+            adjusted_expiry = client.expiry_time
+            if client.expiry_time < now_ms:
+                adjusted_expiry += 10800000  # +3 часа
+                logger.debug(f"Попытка корректировки времени истечения на +3 часа (мс): {adjusted_expiry}")
+            if adjusted_expiry <= now_ms:
+                adjusted_expiry += 10800000  # ещё +3 часа
+                logger.debug(f"Попытка дополнительной корректировки на +6 часов (мс): {adjusted_expiry}")
+            
+            if client.enable and adjusted_expiry > now_ms:
+                expiry_time = datetime.datetime.fromtimestamp(adjusted_expiry / 1000, datetime.timezone.utc)
+                logger.debug(f"Подписка активна, истекает: {expiry_time}")
+                return {
+                    'activ': 'Активен', 
+                    'time': expiry_time.strftime('%d.%m.%Y'), 
+                    'location': 'Netherlands'
+                }
+            else:
+                logger.debug(f"Подписка неактивна, adjusted_expiry: {adjusted_expiry}, now_ms: {now_ms}")
+                return {'activ': 'Не Активен', 'time': '-', 'location': 'Netherlands'}
+        except Exception as e:
+            logger.error(f"Ошибка проверки статуса клиента 3x-ui: {str(e)}")
+            raise Exception(f"Ошибка проверки статуса: {str(e)}")
+
+    def get_connection_link(self, user_id, username=None, client_id=None):
+        try:
+            # Ищем клиента только по tg_id
+            client = None
+            email = None
+            for inbound in self.get_client_list():
+                for c in inbound.settings.clients:
+                    if c.tg_id == str(user_id):
+                        client = c
+                        email = c.email
+                        break
+                if client:
+                    break
+            if not client:
+                raise Exception("Клиент не найден")
+            if not client_id:
+                user_uuid = client.id
+            else:
+                user_uuid = client_id
+            inbound = self.get_client_list()[0]
+            return self._generate_connection_string(inbound, user_uuid, email)
+        except Exception as e:
+            logger.error(f"Ошибка получения VLESS-ссылки: {str(e)}")
+            raise Exception(f"Ошибка получения ссылки: {str(e)}")
 
     def _calculate_expiry_time(self, days):
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -116,62 +211,6 @@ class X3UI:
         x_time = int((expiry - epoch).total_seconds() * 1000.0)
         logger.debug(f"Вычисленное время истечения (мс, UTC): {x_time} для {days} дней")
         return x_time
-
-    def get_client_status(self, user_id, username=None):
-        try:
-            email = username if username and username.strip() else str(user_id)
-            inbounds = self.get_client_list()
-            for inbound in inbounds:
-                for client in inbound.settings.clients:
-                    if client.email == email:
-                        now_ms = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
-                        logger.debug(f"Текущее время (мс, UTC): {now_ms}, Исходное expiry_time: {client.expiry_time}")
-                        
-                        if client.expiry_time is None or client.expiry_time <= 0:
-                            logger.warning(f"Некорректное значение expiry_time для клиента {email}: {client.expiry_time}")
-                            return {'activ': 'Не Активен', 'time': '-', 'location': 'Netherlands'}
-                        
-                        adjusted_expiry = client.expiry_time
-                        if client.expiry_time < now_ms:
-                            adjusted_expiry += 10800000  # +3 часа
-                            logger.debug(f"Попытка корректировки времени истечения на +3 часа (мс): {adjusted_expiry}")
-                        if adjusted_expiry <= now_ms:
-                            adjusted_expiry += 10800000  # ещё +3 часа
-                            logger.debug(f"Попытка дополнительной корректировки на +6 часов (мс): {adjusted_expiry}")
-                        
-                        if client.enable and adjusted_expiry > now_ms:
-                            expiry_time = datetime.datetime.fromtimestamp(adjusted_expiry / 1000, datetime.timezone.utc)
-                            logger.debug(f"Подписка активна, истекает: {expiry_time}")
-                            return {
-                                'activ': 'Активен', 
-                                'time': expiry_time.strftime('%d.%m.%Y'), 
-                                'location': 'Netherlands'
-                            }
-                        else:
-                            logger.debug(f"Подписка неактивна, adjusted_expiry: {adjusted_expiry}, now_ms: {now_ms}")
-                            return {'activ': 'Не Активен', 'time': '-', 'location': 'Netherlands'}
-        
-            logger.debug(f"Клиент {email} не зарегистрирован")
-            return {'activ': 'Не зарегистрирован', 'time': '-', 'location': 'Netherlands'}
-        except Exception as e:
-            logger.error(f"Ошибка проверки статуса клиента 3x-ui: {str(e)}")
-            raise Exception(f"Ошибка проверки статуса: {str(e)}")
-
-    def get_connection_link(self, user_id, username=None, client_id=None):
-        try:
-            email = username if username and username.strip() else str(user_id)
-            if not client_id:
-                inbounds = self.get_client_list()
-                user_uuid = next((client.id for inbound in inbounds for client in inbound.settings.clients if client.email == email), None)
-                if not user_uuid:
-                    raise Exception("Клиент не найден")
-            else:
-                user_uuid = client_id
-            inbound = self.get_client_list()[0]
-            return self._generate_connection_string(inbound, user_uuid, email)
-        except Exception as e:
-            logger.error(f"Ошибка получения VLESS-ссылки: {str(e)}")
-            raise Exception(f"Ошибка получения ссылки: {str(e)}")
 
     def _generate_connection_string(self, inbound: Inbound, user_uuid: str, user_email: str) -> str:
         try:
@@ -242,7 +281,7 @@ class X3UI:
 # Инициализация VPN-сервера
 vpn = X3UI()
 
-# Клавиатуры
+# Клавиатуры (оставляем без изменений)
 def get_initial_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"{emoji.emojize(':star:')} Купить VPN", callback_data="buy_vpn")],
@@ -286,7 +325,7 @@ async def get_my_vpn_keyboard(user_id, context: ContextTypes.DEFAULT_TYPE):
             ])
     except (BadRequest, Forbidden, NetworkError, TimedOut) as e:
         logger.error(f"Ошибка проверки подписки на канал: {str(e)}")
-    status = vpn.get_client_status(user_id, None)
+    status = vpn.get_client_status(user_id)
     if status['activ'] == 'Не Активен':
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("Купить подписку", callback_data="buy_vpn")],
@@ -304,7 +343,7 @@ def get_vpn_link_keyboard(link, expiry_date):
         [InlineKeyboardButton("Назад", callback_data="back_to_my_vpn")]
     ])
 
-# Обработчики
+# Обработчики (оставляем без изменений, кроме исправления ChatMemberHandler)
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     user_id = str(user.id)
@@ -373,13 +412,13 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
     logger.debug(f"Successful payment: {payment.to_dict()}")
     days = int(payload.split('_')[1])
     
-    status_info = vpn.get_client_status(user_id, username)
+    status_info = vpn.get_client_status(user_id)
     if status_info['activ'] in ['Не Активен', 'Не зарегистрирован']:
-        tg_id = str(user.id)
-        referral_bonus = 0  # Бонус за регистрацию не добавляем здесь
-        client_id, email = vpn.add_client(days, tg_id, user_id, username, referral_bonus, context)
-        link = vpn.get_connection_link(user_id, username, client_id)
-        status_info = vpn.get_client_status(user_id, username)
+        tg_id = str(user_id)
+        referral_bonus = 0
+        client_id, email = vpn.add_client(days, tg_id, user_id, referral_bonus=referral_bonus, context=context)
+        link = vpn.get_connection_link(user_id)
+        status_info = vpn.get_client_status(user_id)
         mono_link = f"```\n{link}\n```"
         await update.message.reply_text(
             f"Оплата прошла успешно!\nПодписка на {days} дней создана!\nNetherlands | до {status_info['time']}\nVLESS-ссылка:\n{mono_link}",
@@ -447,10 +486,10 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if data == "show_vpn_status":
-            status_info = vpn.get_client_status(user_id, username)
+            status_info = vpn.get_client_status(user_id)
             if status_info['activ'] == 'Активен':
                 expiry_date = status_info['time']
-                link = vpn.get_connection_link(user_id, username)
+                link = vpn.get_connection_link(user_id)
                 mono_link = f"```\n{link}\n```"
                 await query.edit_message_text(
                     f"Вот ваша ссылка\nДо {expiry_date}\nVLESS-ссылка:\n{mono_link}",
@@ -495,20 +534,20 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if data == "withdraw_bonus":
             stats = vpn.get_referral_stats(user_id)
-            if stats['bonus_days'] > 0 and vpn.has_active_subscription(user_id, username):
-                status = vpn.get_client_status(user_id, username)
+            if stats['bonus_days'] > 0 and vpn.has_active_subscription(user_id):
+                status = vpn.get_client_status(user_id)
                 current_expiry = datetime.datetime.strptime(status['time'], '%d.%m.%Y', tzinfo=datetime.timezone.utc)
                 new_expiry = current_expiry + datetime.timedelta(days=stats['bonus_days'])
-                email = username if username and username.strip() else str(user_id)
+                email = vpn._generate_unique_email(user_id)  # Используем для поиска клиента
                 inbounds = vpn.get_client_list()
                 for inbound in inbounds:
                     for client in inbound.settings.clients:
-                        if client.email == email:
+                        if client.tg_id == str(user_id):
                             client.expiry_time = int((new_expiry - datetime.datetime.fromtimestamp(0, datetime.timezone.utc)).total_seconds() * 1000.0)
                             vpn.api.client.update(client.id, client)
                             break
                 referrals_data = vpn.load_referrals()
-                referrals_data[str(user_id)]["bonus_days"] = 0  # Сбрасываем бонусные дни
+                referrals_data[str(user_id)]["bonus_days"] = 0
                 vpn.save_referrals(referrals_data)
                 await query.edit_message_text(
                     f"Бонусные дни выведены!\nNetherlands | до {new_expiry.strftime('%d.%m.%Y')}",
@@ -531,7 +570,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tariff = tariffs[data]
             days = tariff["days"]
             amount = tariff["amount"]
-            status_info = vpn.get_client_status(user_id, username)
+            status_info = vpn.get_client_status(user_id)
             if status_info['activ'] in ['Не Активен', 'Не зарегистрирован']:
                 logger.debug(f"Отправка инвойса: user_id={user_id}, days={days}, amount={amount}")
                 await context.bot.send_invoice(
@@ -541,10 +580,10 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     payload=f"buy_{days}",
                     provider_token=PROVIDER_TOKEN,
                     currency="RUB",
-                    prices=[{"label": "Подписка", "amount": int(amount * 100)}],  # Сумма в копейках
+                    prices=[{"label": "Подписка", "amount": int(amount * 100)}],
                     start_parameter=f"buy_{days}",
-                    need_email=True,  # Запрашиваем email для чека
-                    send_email_to_provider=True,  # Отправляем email в YooKassa
+                    need_email=True,
+                    send_email_to_provider=True,
                     provider_data={
                         "receipt": {
                             "items": [
@@ -598,6 +637,9 @@ async def check_subscriptions(context: ContextTypes.DEFAULT_TYPE):
 
 async def check_channel_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
+        # Проверяем, что событие связано с нужным чатом
+        if update.chat_member.chat.id != CHANNEL_ID:
+            return
         if update.chat_member.new_chat_member.status in ['member', 'administrator', 'creator']:
             user_id = str(update.chat_member.new_chat_member.user.id)
             context.bot_data.setdefault('users', set()).add(user_id)
@@ -613,7 +655,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     user_id = str(user.id)
     username = user.username
-    status_info = vpn.get_client_status(user_id, username)
+    status_info = vpn.get_client_status(user_id)
     if status_info['activ'] == 'Активен':
         await update.message.reply_text(f"Netherlands | до {status_info['time']}")
     else:
@@ -623,9 +665,9 @@ async def get_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     user_id = str(user.id)
     username = user.username
-    status_info = vpn.get_client_status(user_id, username)
+    status_info = vpn.get_client_status(user_id)
     if status_info['activ'] == 'Активен':
-        link = vpn.get_connection_link(user_id, username)
+        link = vpn.get_connection_link(user_id)
         expiry_date = status_info['time']
         mono_link = f"```\n{link}\n```"
         await update.message.reply_text(f"Netherlands | до {expiry_date}\nVLESS-ссылка:\n{mono_link}", reply_markup=get_vpn_link_keyboard(link, expiry_date), parse_mode=ParseMode.MARKDOWN)
@@ -644,7 +686,7 @@ async def run_bot():
     application.add_handler(CommandHandler("link", get_link))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_handler(MessageHandler(filters.COMMAND, unknown))
-    application.add_handler(ChatMemberHandler(check_channel_subscription, chat_id=CHANNEL_ID))
+    application.add_handler(ChatMemberHandler(check_channel_subscription))  # Убрали chat_id
     application.add_handler(CallbackQueryHandler(button))
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
